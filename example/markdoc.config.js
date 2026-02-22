@@ -315,4 +315,8 @@ module.exports = {
   tags: { comment, callout, tabs, tab, badge, details },
   variables,
   functions,
+  resetState() {
+    seenHeadingIds.clear();
+    tabSetCounter = 0;
+  },
 };

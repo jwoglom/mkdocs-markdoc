@@ -2,21 +2,25 @@
 /**
  * markdoc_runner.js
  *
- * Reads raw Markdown from stdin, renders it to HTML with @markdoc/markdoc,
- * and writes the HTML to stdout.
+ * Persistent Node.js process that renders Markdoc pages for the MkDocs plugin.
  *
- * Usage (invoked by the Python plugin):
- *   echo "# Hello" | node markdoc_runner.js [--config <path>]
+ * Protocol (newline-delimited JSON over stdin/stdout):
+ *   Request  → {"markdown": "..."}
+ *   Response → {"html": "...", "warnings": [...]}
+ *             | {"error": "..."}
  *
- * Exit codes:
- *   0  success – HTML written to stdout
- *   1  error   – message written to stderr
+ * The process stays alive until stdin is closed, amortising Node.js startup
+ * and @markdoc/markdoc module load cost across all pages in the build.
+ *
+ * Usage:
+ *   node markdoc_runner.js [--config <path>]
  */
 
 "use strict";
 
 const path = require("path");
 const fs = require("fs");
+const readline = require("readline");
 
 // ---------------------------------------------------------------------------
 // Argument parsing  (minimal – only --config <path> is supported)
@@ -50,88 +54,98 @@ function loadMarkdocConfig(configPath) {
   }
 
   // Treat .js / .cjs as a CommonJS module exporting a config object.
-  // The module may export the config directly or as `module.exports.default`.
   const mod = require(configPath);
   return mod.default ?? mod;
+}
+
+// ---------------------------------------------------------------------------
+// Startup – load Markdoc and config once for the lifetime of the process
+// ---------------------------------------------------------------------------
+
+let Markdoc;
+try {
+  Markdoc = require("@markdoc/markdoc");
+} catch (err) {
+  process.stderr.write(
+    "@markdoc/markdoc is not installed. " +
+      "Run `npm install @markdoc/markdoc` in the plugin directory or globally.\n" +
+      err.message + "\n"
+  );
+  process.exit(1);
+}
+
+const args = parseArgs(process.argv);
+let markdocConfig;
+try {
+  markdocConfig = loadMarkdocConfig(args.configPath);
+} catch (err) {
+  process.stderr.write(`mkdocs-markdoc: failed to load config: ${err.message}\n`);
+  process.exit(1);
 }
 
 // ---------------------------------------------------------------------------
 // Render pipeline
 // ---------------------------------------------------------------------------
 
-function renderMarkdoc(source, markdocConfig) {
-  // Lazy-require so a missing package produces a clear error message.
-  let Markdoc;
-  try {
-    Markdoc = require("@markdoc/markdoc");
-  } catch (err) {
-    throw new Error(
-      "@markdoc/markdoc is not installed. " +
-        "Run `npm install @markdoc/markdoc` in the plugin directory or globally.\n" +
-        err.message
-    );
+function renderMarkdoc(source) {
+  // Reset per-page state (heading ID dedup counter, tab set counter, etc.)
+  // if the config exports a resetState() helper.
+  if (typeof markdocConfig.resetState === "function") {
+    markdocConfig.resetState();
   }
 
-  // 1. Parse – produces an AST.
   const ast = Markdoc.parse(source);
 
-  // 2. Validate – surface any Markdoc schema errors before transforming.
+  // Collect warnings; only hard-fail on error-level issues.
   const errors = Markdoc.validate(ast, markdocConfig);
+  const warnings = [];
   if (errors.length > 0) {
-    const messages = errors
-      .map((e) => `  [${e.error.level}] ${e.error.message} (line ${e.lines?.[0] ?? "?"})`)
-      .join("\n");
-
-    // Only hard-fail on actual errors; warnings/hints are logged to stderr.
-    const fatal = errors.filter((e) => e.error.level === "error");
-    if (fatal.length > 0) {
-      throw new Error(`Markdoc validation errors:\n${messages}`);
+    const fatal = [];
+    for (const e of errors) {
+      const msg = `[${e.error.level}] ${e.error.message} (line ${e.lines?.[0] ?? "?"})`;
+      if (e.error.level === "error") {
+        fatal.push(msg);
+      } else {
+        warnings.push(msg);
+      }
     }
-
-    process.stderr.write(`mkdocs-markdoc: Markdoc warnings:\n${messages}\n`);
+    if (fatal.length > 0) {
+      throw new Error(`Markdoc validation errors:\n${fatal.join("\n")}`);
+    }
   }
 
-  // 3. Transform – converts AST to a renderable tree using the config.
   const renderableTree = Markdoc.transform(ast, markdocConfig);
-
-  // 4. Render to plain HTML (no React dependency).
-  return Markdoc.renderers.html(renderableTree);
+  const html = Markdoc.renderers.html(renderableTree);
+  return { html, warnings };
 }
 
 // ---------------------------------------------------------------------------
-// Main – read stdin, render, write stdout
+// Main loop – read one JSON line per request, write one JSON line per response
 // ---------------------------------------------------------------------------
 
-async function main() {
-  const args = parseArgs(process.argv);
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 
-  let markdocConfig;
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+
+  let markdown;
   try {
-    markdocConfig = loadMarkdocConfig(args.configPath);
+    ({ markdown } = JSON.parse(line));
   } catch (err) {
-    process.stderr.write(`mkdocs-markdoc: failed to load config: ${err.message}\n`);
-    process.exit(1);
+    process.stdout.write(
+      JSON.stringify({ error: `Invalid request JSON: ${err.message}` }) + "\n"
+    );
+    return;
   }
 
-  // Collect stdin into a single string.
-  const chunks = [];
-  for await (const chunk of process.stdin) {
-    chunks.push(chunk);
-  }
-  const source = Buffer.concat(chunks.map((c) => Buffer.from(c))).toString("utf8");
-
-  let html;
   try {
-    html = renderMarkdoc(source, markdocConfig);
+    const { html, warnings } = renderMarkdoc(markdown);
+    process.stdout.write(JSON.stringify({ html, warnings }) + "\n");
   } catch (err) {
-    process.stderr.write(`mkdocs-markdoc: render error: ${err.message}\n`);
-    process.exit(1);
+    process.stdout.write(JSON.stringify({ error: err.message }) + "\n");
   }
+});
 
-  process.stdout.write(html);
-}
-
-main().catch((err) => {
-  process.stderr.write(`mkdocs-markdoc: unexpected error: ${err.message}\n`);
-  process.exit(1);
+rl.on("close", () => {
+  process.exit(0);
 });

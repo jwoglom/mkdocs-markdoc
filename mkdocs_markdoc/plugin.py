@@ -1,15 +1,18 @@
 """
 MkDocs plugin that replaces the default Python-Markdown renderer with
-Stripe's Markdoc, via a bundled Node.js subprocess.
+Stripe's Markdoc, via a persistent Node.js subprocess.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import subprocess
+import threading
 from html.parser import HTMLParser
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Any
 
 from mkdocs.config import config_options
@@ -95,21 +98,26 @@ class MarkdocPluginConfig(Config):
     # `require()`. When empty the runner uses bare Markdoc defaults.
     markdoc_config = config_options.Optional(config_options.File(exists=True))
 
-    # Milliseconds before the Node subprocess is killed and an error raised.
+    # Milliseconds before a single-page render is killed and an error raised.
     timeout = config_options.Type(int, default=30_000)
 
 
 class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
     """
-    Intercepts raw Markdown on every page and hands it to the Node.js Markdoc
-    runner.  The runner returns a plain HTML string that MkDocs then injects
-    into its theme template exactly as it would with the normal renderer.
+    Intercepts raw Markdown on every page and hands it to a persistent Node.js
+    Markdoc process.  The process is started once per build in on_config,
+    eliminating per-page Node.js VM startup and module-load overhead.
 
     Lifecycle
     ---------
-    on_config  – validate that Node.js is available once, up front.
-    on_page_markdown – convert each page's Markdown to HTML via subprocess.
+    on_config        – validate Node.js, start the persistent subprocess.
+    on_files         – inject the bundled markdoc.css asset.
+    on_page_markdown – send each page to Node.js over stdin, receive HTML.
+    on_page_content  – rebuild page.toc from the id-annotated headings.
+    on_shutdown      – close the subprocess cleanly.
     """
+
+    _proc: subprocess.Popen | None = None
 
     def on_config(self, config: dict[str, Any]) -> dict[str, Any]:
         node_exec = self.config["node_path"]
@@ -141,6 +149,21 @@ class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
                 f"or in the project directory).\nNode stderr: {stderr}"
             )
 
+        # Start the persistent Node.js process for the duration of the build.
+        cmd = [self._node_exec, str(_RUNNER_PATH)]
+        if self.config["markdoc_config"]:
+            cmd += ["--config", self.config["markdoc_config"]]
+
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,   # inherit – unexpected Node crashes surface immediately
+            text=True,
+            encoding="utf-8",
+        )
+        log.debug("mkdocs-markdoc: started persistent Node.js process (pid %d)", self._proc.pid)
+
         return config
 
     def on_files(self, files: Files, config: dict[str, Any], **kwargs: Any) -> Files:
@@ -154,7 +177,7 @@ class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
         return files
 
     # ------------------------------------------------------------------
-    # Core hook
+    # Core hooks
     # ------------------------------------------------------------------
 
     def on_page_markdown(
@@ -168,37 +191,7 @@ class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
         Called by MkDocs with the raw Markdown string for every page.
         Returns the rendered HTML string.
         """
-        try:
-            result = self._run_node_runner(markdown)
-        except FileNotFoundError:
-            # Node executable disappeared between on_config and now.
-            raise RuntimeError(
-                f"mkdocs-markdoc: Node.js executable '{self._node_exec}' "
-                "disappeared during the build."
-            )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(
-                f"mkdocs-markdoc: Node.js subprocess timed out after "
-                f"{self.config['timeout']} ms while processing "
-                f"'{page.file.src_path}'."
-            )
-
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            raise RuntimeError(
-                f"mkdocs-markdoc: Markdoc rendering failed for "
-                f"'{page.file.src_path}'.\nNode stderr: {stderr}"
-            )
-
-        html = result.stdout
-        if not html:
-            log.warning(
-                "mkdocs-markdoc: empty HTML output for '%s' – "
-                "returning empty string.",
-                page.file.src_path,
-            )
-
-        return html
+        return self._render(markdown, page.file.src_path)
 
     def on_page_content(
         self,
@@ -218,23 +211,83 @@ class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
         page.toc = _toc_from_html(html)
         return html
 
+    def on_shutdown(self) -> None:
+        """Cleanly terminate the persistent Node.js process."""
+        if self._proc and self._proc.poll() is None:
+            self._proc.stdin.close()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+            log.debug("mkdocs-markdoc: Node.js process exited")
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _run_node_runner(self, markdown: str) -> subprocess.CompletedProcess:
-        """Pipe *markdown* into markdoc_runner.js and return the result."""
-        cmd = [self._node_exec, str(_RUNNER_PATH)]
-        if self.config["markdoc_config"]:
-            cmd += ["--config", self.config["markdoc_config"]]
+    def _render(self, markdown: str, src_path: str) -> str:
+        """Send one page to the persistent Node process and return HTML."""
+        if self._proc is None or self._proc.poll() is not None:
+            raise RuntimeError(
+                "mkdocs-markdoc: Node.js process is not running."
+            )
 
-        return subprocess.run(
-            cmd,
-            input=markdown,
-            capture_output=True,
-            text=True,
-            timeout=self.config["timeout"] / 1000,  # subprocess uses seconds
-        )
+        msg = json.dumps({"markdown": markdown}) + "\n"
+        self._proc.stdin.write(msg)
+        self._proc.stdin.flush()
+
+        # Read the response line in a background thread so we can enforce the
+        # per-page timeout without blocking the main thread indefinitely.
+        q: Queue[str | Exception] = Queue()
+
+        def _read() -> None:
+            try:
+                q.put(self._proc.stdout.readline())
+            except Exception as exc:  # noqa: BLE001
+                q.put(exc)
+
+        threading.Thread(target=_read, daemon=True).start()
+
+        timeout_s = self.config["timeout"] / 1000
+        try:
+            result = q.get(timeout=timeout_s)
+        except Empty:
+            self._proc.kill()
+            raise RuntimeError(
+                f"mkdocs-markdoc: Node.js timed out after {self.config['timeout']} ms "
+                f"while processing '{src_path}'."
+            )
+
+        if isinstance(result, Exception):
+            raise RuntimeError(
+                f"mkdocs-markdoc: error reading from Node.js process: {result}"
+            )
+
+        if not result:
+            raise RuntimeError(
+                f"mkdocs-markdoc: Node.js process exited unexpectedly while "
+                f"processing '{src_path}'."
+            )
+
+        response = json.loads(result)
+
+        if "error" in response:
+            raise RuntimeError(
+                f"mkdocs-markdoc: Markdoc rendering failed for '{src_path}'.\n"
+                f"Node error: {response['error']}"
+            )
+
+        for warning in response.get("warnings", []):
+            log.warning("mkdocs-markdoc [%s]: %s", src_path, warning)
+
+        html = response["html"]
+        if not html:
+            log.warning(
+                "mkdocs-markdoc: empty HTML output for '%s' – returning empty string.",
+                src_path,
+            )
+
+        return html
 
     def _run_node(self, script: str) -> subprocess.CompletedProcess:
         """Run an inline Node.js *script* string for quick checks."""
