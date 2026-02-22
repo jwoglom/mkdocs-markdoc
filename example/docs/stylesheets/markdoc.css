@@ -1,0 +1,95 @@
+/*
+ * markdoc.css — styling for elements that Markdoc emits but Material doesn't
+ * cover on its own (badges, details, code block tweaks).
+ *
+ * Most standard HTML elements (headings, tables, blockquotes, lists, etc.)
+ * are already styled by Material's .md-typeset rules because our plugin output
+ * lands inside that wrapper.
+ */
+
+/* -------------------------------------------------------------------------
+ * Code blocks
+ * Our fence override renders <pre><code class="language-X">.
+ * highlight.js adds the `hljs` class; we normalise padding to match Material.
+ * ---------------------------------------------------------------------- */
+
+.md-typeset pre > code.hljs {
+  padding: 1em 1.2em;
+  border-radius: 0.2rem;
+  font-size: 0.85em;
+  line-height: 1.6;
+}
+
+.md-typeset pre {
+  position: relative;
+}
+
+/* -------------------------------------------------------------------------
+ * Admonitions  (callout → Material .admonition markup, styled for free)
+ * ---------------------------------------------------------------------- */
+
+.md-typeset .admonition {
+  margin: 1.5em 0;
+}
+
+/* -------------------------------------------------------------------------
+ * Badge  (inline colored chips)
+ * ---------------------------------------------------------------------- */
+
+.md-typeset .mkd-badge {
+  display: inline-block;
+  padding: 0.1em 0.55em;
+  border-radius: 0.25rem;
+  font-size: 0.72em;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  line-height: 1.6;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.md-typeset .mkd-badge--blue   { background-color: #1976d2; color: #fff; }
+.md-typeset .mkd-badge--green  { background-color: #388e3c; color: #fff; }
+.md-typeset .mkd-badge--red    { background-color: #d32f2f; color: #fff; }
+.md-typeset .mkd-badge--orange { background-color: #e65100; color: #fff; }
+.md-typeset .mkd-badge--grey   { background-color: #616161; color: #fff; }
+.md-typeset .mkd-badge--purple { background-color: #6a1b9a; color: #fff; }
+
+/* -------------------------------------------------------------------------
+ * Details  (collapsible <details>/<summary>)
+ *
+ * Material for MkDocs already styles all `details > summary` elements with
+ * its own disclosure icon (the right-side chevron) and flex layout. Adding
+ * our own ::before marker on top produces a double-icon overlap and pushes
+ * text mid-word. We therefore only set box-level styles here and let
+ * Material's built-in `details` CSS handle the indicator entirely.
+ * ---------------------------------------------------------------------- */
+
+.md-typeset details.mkd-details {
+  border-left: 4px solid var(--md-primary-fg-color);
+  background-color: var(--md-admonition-bg-color, rgba(68, 138, 255, .05));
+  border-radius: 0.2rem;
+  padding: 0 1em;
+  margin: 1.25em 0;
+}
+
+/* Tighten summary text weight to make it feel like a heading */
+.md-typeset details.mkd-details > summary {
+  font-weight: 600;
+}
+
+/* Separate summary from body when open */
+.md-typeset details.mkd-details[open] > summary {
+  border-bottom: 1px solid var(--md-default-fg-color--lightest);
+  margin-bottom: 0.25em;
+}
+
+/* -------------------------------------------------------------------------
+ * Tables
+ * Markdoc renders plain <table> elements; Material styles them inside
+ * .md-typeset automatically. Enforce full width for consistency.
+ * ---------------------------------------------------------------------- */
+
+.md-typeset table:not([class]) {
+  width: 100%;
+}

@@ -15,7 +15,7 @@ env/
 node_modules/
 
 # MkDocs built output
-test/site/
+example/site/
 
 # Editor / OS
 .DS_Store

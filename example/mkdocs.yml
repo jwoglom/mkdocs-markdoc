@@ -1,0 +1,45 @@
+site_name: Markdoc + Material Test Site
+site_description: MkDocs site rendered entirely by Stripe's Markdoc
+docs_dir: docs
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - content.tabs.link
+    - toc.integrate
+
+plugins:
+  - search
+  - markdoc:
+      markdoc_config: markdoc.config.js
+
+extra_css:
+  - stylesheets/markdoc.css
+
+extra_javascript:
+  - javascripts/hljs-init.js
+
+nav:
+  - Home: index.md
+  - Showcase: showcase.md
+  - Guide:
+      - How It Works: guide.md
+      - Callouts & Tags: callout.md
+      - Code Blocks: code.md
