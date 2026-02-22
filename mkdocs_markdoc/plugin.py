@@ -15,6 +15,7 @@ from typing import Any
 from mkdocs.config import config_options
 from mkdocs.config.base import Config
 from mkdocs.plugins import BasePlugin
+from mkdocs.structure.files import File, Files
 from mkdocs.structure.pages import Page
 from mkdocs.structure.toc import AnchorLink, TableOfContents
 
@@ -125,6 +126,9 @@ class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
         self._node_exec = resolved
         log.debug("mkdocs-markdoc: using Node.js at %s", resolved)
 
+        # Inject the bundled stylesheet so it loads before any user extra_css.
+        config.setdefault("extra_css", []).insert(0, "assets/markdoc.css")
+
         # Verify @markdoc/markdoc is installed where the runner can reach it.
         check = self._run_node(
             "require('@markdoc/markdoc'); process.stdout.write('ok');"
@@ -138,6 +142,16 @@ class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
             )
 
         return config
+
+    def on_files(self, files: Files, config: dict[str, Any], **kwargs: Any) -> Files:
+        """Inject the bundled markdoc.css into the MkDocs file collection."""
+        files.append(File(
+            path="assets/markdoc.css",
+            src_dir=str(Path(__file__).parent),
+            dest_dir=config["site_dir"],
+            use_directory_urls=config["use_directory_urls"],
+        ))
+        return files
 
     # ------------------------------------------------------------------
     # Core hook

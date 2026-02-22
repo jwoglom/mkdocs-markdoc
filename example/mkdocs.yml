@@ -30,9 +30,6 @@ plugins:
   - markdoc:
       markdoc_config: markdoc.config.js
 
-extra_css:
-  - stylesheets/markdoc.css
-
 extra_javascript:
   - javascripts/hljs-init.js
 
