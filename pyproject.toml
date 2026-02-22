@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mkdocs-markdoc"
+version = "0.1.0"
+description = "MkDocs plugin that renders pages with Stripe's Markdoc instead of Python-Markdown"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+keywords = ["mkdocs", "markdoc", "markdown", "plugin", "documentation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Documentation",
+    "Topic :: Software Development :: Documentation",
+]
+dependencies = [
+    "mkdocs>=1.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "pytest-mock>=3",
+]
+
+[project.entry-points."mkdocs.plugins"]
+markdoc = "mkdocs_markdoc.plugin:MarkdocPlugin"
+
+# ---------------------------------------------------------------------------
+# Hatch build – make sure the JS runner is included in the wheel/sdist.
+# ---------------------------------------------------------------------------
+
+[tool.hatch.build.targets.wheel]
+packages = ["mkdocs_markdoc"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "mkdocs_markdoc/**",
+    "README.md",
+    "pyproject.toml",
+]
+
+# ---------------------------------------------------------------------------
+# Ruff (optional – only applied when ruff is installed)
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
