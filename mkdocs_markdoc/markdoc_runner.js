@@ -9,8 +9,22 @@
  *   Response → {"html": "...", "warnings": [...]}
  *             | {"error": "..."}
  *
- * The process stays alive until stdin is closed, amortising Node.js startup
- * and @markdoc/markdoc module load cost across all pages in the build.
+ * Built-in defaults (user config can override any of these):
+ *
+ *   Nodes
+ *     heading — slugified id attribute on every heading for MkDocs TOC
+ *     fence   — <pre><code class="language-X"> for highlight.js
+ *
+ *   Tags
+ *     callout  — Material admonition (note/tip/info/warning/danger/success)
+ *     comment  — stripped from output entirely
+ *     tabs     — Material radio-button tabbed content
+ *     tab      — individual tab panel (child of tabs)
+ *     badge    — inline coloured chip
+ *     details  — native <details>/<summary> collapsible
+ *
+ *   Functions
+ *     upper(s), lower(s), concat(...), default(val, fallback)
  *
  * Usage:
  *   node markdoc_runner.js [--config <path>]
@@ -23,7 +37,7 @@ const fs = require("fs");
 const readline = require("readline");
 
 // ---------------------------------------------------------------------------
-// Argument parsing  (minimal – only --config <path> is supported)
+// Argument parsing
 // ---------------------------------------------------------------------------
 
 function parseArgs(argv) {
@@ -37,29 +51,7 @@ function parseArgs(argv) {
 }
 
 // ---------------------------------------------------------------------------
-// Load optional Markdoc config
-// ---------------------------------------------------------------------------
-
-function loadMarkdocConfig(configPath) {
-  if (!configPath) return {};
-
-  if (!fs.existsSync(configPath)) {
-    throw new Error(`Markdoc config file not found: ${configPath}`);
-  }
-
-  const ext = path.extname(configPath).toLowerCase();
-
-  if (ext === ".json") {
-    return JSON.parse(fs.readFileSync(configPath, "utf8"));
-  }
-
-  // Treat .js / .cjs as a CommonJS module exporting a config object.
-  const mod = require(configPath);
-  return mod.default ?? mod;
-}
-
-// ---------------------------------------------------------------------------
-// Startup – load Markdoc and config once for the lifetime of the process
+// Startup – load Markdoc and optional user config once
 // ---------------------------------------------------------------------------
 
 let Markdoc;
@@ -74,13 +66,242 @@ try {
   process.exit(1);
 }
 
+const { nodes: defaultNodes, Tag } = Markdoc;
+
+function loadUserConfig(configPath) {
+  if (!configPath) return null;
+  if (!fs.existsSync(configPath)) {
+    throw new Error(`Markdoc config file not found: ${configPath}`);
+  }
+  const ext = path.extname(configPath).toLowerCase();
+  if (ext === ".json") {
+    return JSON.parse(fs.readFileSync(configPath, "utf8"));
+  }
+  const mod = require(configPath);
+  return mod.default ?? mod;
+}
+
 const args = parseArgs(process.argv);
-let markdocConfig;
+let userConfigSource;
 try {
-  markdocConfig = loadMarkdocConfig(args.configPath);
+  userConfigSource = loadUserConfig(args.configPath);
 } catch (err) {
   process.stderr.write(`mkdocs-markdoc: failed to load config: ${err.message}\n`);
   process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function capitalize(str) {
+  return String(str).charAt(0).toUpperCase() + String(str).slice(1);
+}
+
+function slugify(text) {
+  return text
+    .normalize("NFC")
+    .toLowerCase()
+    .replace(/[^\w\s-]/g, "")
+    .trim()
+    .replace(/[-\s]+/g, "-");
+}
+
+function extractText(children) {
+  return (children || [])
+    .map((child) => {
+      if (typeof child === "string") return child;
+      if (Array.isArray(child)) return extractText(child);
+      if (child && child.children) return extractText(child.children);
+      return "";
+    })
+    .join("");
+}
+
+// ---------------------------------------------------------------------------
+// Built-in stateless nodes + tags (defined once at module level)
+// ---------------------------------------------------------------------------
+
+const builtinFence = {
+  ...defaultNodes.fence,
+  transform(node, config) {
+    const lang = node.attributes.language || "";
+    const content = node.attributes.content || "";
+    const codeAttrs = lang ? { class: `language-${lang}` } : {};
+    return new Tag("pre", {}, [new Tag("code", codeAttrs, [content])]);
+  },
+};
+
+const comment = {
+  children: ["paragraph", "tag", "list", "inline", "text"],
+  transform() { return null; },
+};
+
+const callout = {
+  render: "div",
+  children: ["paragraph", "tag", "list", "fence", "inline", "text"],
+  attributes: {
+    type: {
+      type: String,
+      default: "note",
+      matches: ["note", "tip", "info", "warning", "danger", "success"],
+    },
+    title: { type: String },
+  },
+  transform(node, config) {
+    const type = node.attributes.type || "note";
+    const title = node.attributes.title || capitalize(type);
+    const children = node.transformChildren(config);
+    return new Tag("div", { class: `admonition ${type}` }, [
+      new Tag("p", { class: "admonition-title" }, [title]),
+      ...children,
+    ]);
+  },
+};
+
+const tab = {
+  render: "div",
+  attributes: { label: { type: String, required: true } },
+  transform(node, config) {
+    return new Tag("div", { class: "tabbed-block" }, node.transformChildren(config));
+  },
+};
+
+const badge = {
+  render: "span",
+  inline: true,
+  attributes: {
+    color: {
+      type: String,
+      default: "grey",
+      matches: ["blue", "green", "red", "orange", "grey", "purple"],
+    },
+  },
+  transform(node, config) {
+    const color = node.attributes.color || "grey";
+    return new Tag("span", { class: `mkd-badge mkd-badge--${color}` }, node.transformChildren(config));
+  },
+};
+
+const details = {
+  render: "details",
+  children: ["paragraph", "tag", "list", "fence", "inline", "text"],
+  attributes: {
+    summary: { type: String, required: true },
+    open: { type: Boolean, default: false },
+  },
+  transform(node, config) {
+    const attrs = { class: "mkd-details" };
+    if (node.attributes.open) attrs.open = true;
+    return new Tag("details", attrs, [
+      new Tag("summary", {}, [node.attributes.summary]),
+      ...node.transformChildren(config),
+    ]);
+  },
+};
+
+const builtinFunctions = {
+  upper: { transform(p) { return String(p[0]).toUpperCase(); } },
+  lower: { transform(p) { return String(p[0]).toLowerCase(); } },
+  // In Markdoc 0.5.x parameters arrive as {0: a, 1: b, …}, not an array.
+  concat: { transform(p) { return Object.values(p).join(""); } },
+  default: { transform(p) { return p[0] != null ? p[0] : p[1]; } },
+};
+
+// ---------------------------------------------------------------------------
+// Per-render config builder
+//
+// Called once per page so that stateful transforms get a fresh closure.
+// The heading node needs a fresh ID-dedup map each render; the tabs tag needs
+// a fresh counter.  If the user config is a factory function it is also called
+// here, so user-defined stateful transforms get the same guarantee.
+// ---------------------------------------------------------------------------
+
+function buildRenderConfig() {
+  // --- stateful built-in heading (fresh seenHeadingIds per render) ---
+  const seenHeadingIds = new Map();
+  const builtinHeading = {
+    ...defaultNodes.heading,
+    transform(node, config) {
+      const children = node.transformChildren(config);
+      const level = node.attributes.level;
+      const attrs = {};
+      for (const annotation of node.annotations || []) {
+        if (annotation.type === "id" || annotation.name === "id") {
+          attrs.id = annotation.value;
+        } else if (annotation.type === "class" || annotation.name === "class") {
+          attrs.class = attrs.class ? `${attrs.class} ${annotation.value}` : annotation.value;
+        } else if (annotation.name) {
+          attrs[annotation.name] = annotation.value;
+        }
+      }
+      if (!attrs.id) {
+        const text = extractText(children);
+        const base = slugify(text) || `heading-${level}`;
+        const count = seenHeadingIds.get(base) || 0;
+        attrs.id = count === 0 ? base : `${base}-${count}`;
+        seenHeadingIds.set(base, count + 1);
+      }
+      return new Tag(`h${level}`, attrs, children);
+    },
+  };
+
+  // --- stateful built-in tabs (fresh counter per render) ---
+  let tabSetCounter = 0;
+  const tabs = {
+    render: "div",
+    attributes: {},
+    transform(node, config) {
+      const setId = ++tabSetCounter;
+      const tabNodes = node.children.filter((c) => c.tag === "tab");
+      const labels = tabNodes.map((c) => c.attributes.label || "Tab");
+      const inputs = labels.map((_, i) =>
+        new Tag("input", {
+          type: "radio",
+          name: `__tabbed_${setId}`,
+          id: `__tabbed_${setId}_${i + 1}`,
+          ...(i === 0 ? { checked: true } : {}),
+        }, [])
+      );
+      const labelEls = labels.map((label, i) =>
+        new Tag("label", { for: `__tabbed_${setId}_${i + 1}` }, [label])
+      );
+      return new Tag(
+        "div",
+        { class: "tabbed-set tabbed-alternate", "data-tabs": `${setId}:${labels.length}` },
+        [
+          ...inputs,
+          new Tag("div", { class: "tabbed-labels" }, labelEls),
+          new Tag("div", { class: "tabbed-content" }, node.transformChildren(config)),
+        ]
+      );
+    },
+  };
+
+  // --- resolve user config (factory or plain object) ---
+  const userConfig =
+    typeof userConfigSource === "function"
+      ? userConfigSource()
+      : userConfigSource || {};
+
+  // User entries take precedence over built-ins throughout.
+  return {
+    ...userConfig,
+    nodes: {
+      heading: builtinHeading,
+      fence: builtinFence,
+      ...(userConfig.nodes || {}),
+    },
+    tags: {
+      comment, callout, tabs, tab, badge, details,
+      ...(userConfig.tags || {}),
+    },
+    functions: {
+      ...builtinFunctions,
+      ...(userConfig.functions || {}),
+    },
+    variables: userConfig.variables || {},
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -88,15 +309,10 @@ try {
 // ---------------------------------------------------------------------------
 
 function renderMarkdoc(source) {
-  // Reset per-page state (heading ID dedup counter, tab set counter, etc.)
-  // if the config exports a resetState() helper.
-  if (typeof markdocConfig.resetState === "function") {
-    markdocConfig.resetState();
-  }
+  const markdocConfig = buildRenderConfig();
 
   const ast = Markdoc.parse(source);
 
-  // Collect warnings; only hard-fail on error-level issues.
   const errors = Markdoc.validate(ast, markdocConfig);
   const warnings = [];
   if (errors.length > 0) {
@@ -120,7 +336,7 @@ function renderMarkdoc(source) {
 }
 
 // ---------------------------------------------------------------------------
-// Main loop – read one JSON line per request, write one JSON line per response
+// Main loop
 // ---------------------------------------------------------------------------
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -132,9 +348,7 @@ rl.on("line", (line) => {
   try {
     ({ markdown } = JSON.parse(line));
   } catch (err) {
-    process.stdout.write(
-      JSON.stringify({ error: `Invalid request JSON: ${err.message}` }) + "\n"
-    );
+    process.stdout.write(JSON.stringify({ error: `Invalid request JSON: ${err.message}` }) + "\n");
     return;
   }
 
@@ -146,6 +360,4 @@ rl.on("line", (line) => {
   }
 });
 
-rl.on("close", () => {
-  process.exit(0);
-});
+rl.on("close", () => { process.exit(0); });

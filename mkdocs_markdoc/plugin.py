@@ -1,15 +1,17 @@
 """
 MkDocs plugin that replaces the default Python-Markdown renderer with
-Stripe's Markdoc, via a persistent Node.js subprocess.
+Stripe's Markdoc, via a pool of persistent Node.js subprocesses.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from pathlib import Path
 from queue import Empty, Queue
@@ -101,23 +103,25 @@ class MarkdocPluginConfig(Config):
     # Milliseconds before a single-page render is killed and an error raised.
     timeout = config_options.Type(int, default=30_000)
 
+    # Number of parallel Node.js worker processes.  0 = auto (cpu_count).
+    workers = config_options.Type(int, default=0)
+
 
 class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
     """
-    Intercepts raw Markdown on every page and hands it to a persistent Node.js
-    Markdoc process.  The process is started once per build in on_config,
-    eliminating per-page Node.js VM startup and module-load overhead.
+    Intercepts raw Markdown on every page and hands it to a pool of persistent
+    Node.js Markdoc workers.  All pages are pre-rendered in parallel during
+    on_env so that on_page_markdown is just a cache lookup.
 
     Lifecycle
     ---------
-    on_config        – validate Node.js, start the persistent subprocess.
+    on_config        – validate Node.js, start the worker pool.
     on_files         – inject the bundled markdoc.css asset.
-    on_page_markdown – send each page to Node.js over stdin, receive HTML.
+    on_env           – pre-render all pages in parallel; populate cache.
+    on_page_markdown – return the cached HTML (or render synchronously on miss).
     on_page_content  – rebuild page.toc from the id-annotated headings.
-    on_shutdown      – close the subprocess cleanly.
+    on_shutdown      – terminate all worker processes.
     """
-
-    _proc: subprocess.Popen | None = None
 
     def on_config(self, config: dict[str, Any]) -> dict[str, Any]:
         node_exec = self.config["node_path"]
@@ -149,21 +153,20 @@ class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
                 f"or in the project directory).\nNode stderr: {stderr}"
             )
 
-        # Start the persistent Node.js process for the duration of the build.
-        cmd = [self._node_exec, str(_RUNNER_PATH)]
-        if self.config["markdoc_config"]:
-            cmd += ["--config", self.config["markdoc_config"]]
+        # Start the worker pool.
+        n = self.config["workers"] or os.cpu_count() or 1
+        self._workers: list[subprocess.Popen] = []
+        self._pool: Queue[subprocess.Popen] = Queue()
+        for _ in range(n):
+            w = self._start_worker()
+            self._workers.append(w)
+            self._pool.put(w)
 
-        self._proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=None,   # inherit – unexpected Node crashes surface immediately
-            text=True,
-            encoding="utf-8",
-        )
-        log.debug("mkdocs-markdoc: started persistent Node.js process (pid %d)", self._proc.pid)
+        # Per-build render cache and error store populated by on_env.
+        self._cache: dict[str, str] = {}
+        self._cache_errors: dict[str, Exception] = {}
 
+        log.debug("mkdocs-markdoc: started %d Node.js worker(s)", n)
         return config
 
     def on_files(self, files: Files, config: dict[str, Any], **kwargs: Any) -> Files:
@@ -175,6 +178,42 @@ class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
             use_directory_urls=config["use_directory_urls"],
         ))
         return files
+
+    def on_env(self, env: Any, config: dict[str, Any], files: Files, **kwargs: Any) -> Any:
+        """
+        Pre-render all documentation pages in parallel before MkDocs starts
+        calling on_page_markdown sequentially.
+
+        Each worker process handles one page at a time; the ThreadPoolExecutor
+        keeps all workers busy while Python waits for results.
+        """
+        n_workers = len(self._workers)
+        doc_files = list(files.documentation_pages())
+
+        log.debug(
+            "mkdocs-markdoc: pre-rendering %d page(s) across %d worker(s)",
+            len(doc_files),
+            n_workers,
+        )
+
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            future_to_path = {
+                executor.submit(
+                    self._render_with_pool,
+                    Path(f.abs_src_path).read_text(encoding="utf-8"),
+                    f.src_path,
+                ): f.src_path
+                for f in doc_files
+            }
+
+            for future in as_completed(future_to_path):
+                src_path = future_to_path[future]
+                try:
+                    self._cache[src_path] = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    self._cache_errors[src_path] = exc
+
+        return env
 
     # ------------------------------------------------------------------
     # Core hooks
@@ -188,10 +227,25 @@ class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
         **kwargs: Any,
     ) -> str:
         """
-        Called by MkDocs with the raw Markdown string for every page.
-        Returns the rendered HTML string.
+        Return the HTML that was pre-rendered in on_env.
+
+        Falls back to synchronous rendering on a cache miss (e.g. when another
+        plugin modifies the markdown after on_env runs).
         """
-        return self._render(markdown, page.file.src_path)
+        src_path = page.file.src_path
+
+        if src_path in self._cache_errors:
+            raise self._cache_errors.pop(src_path)
+
+        if src_path in self._cache:
+            return self._cache.pop(src_path)
+
+        # Cache miss – render synchronously.
+        log.warning(
+            "mkdocs-markdoc: cache miss for '%s', rendering synchronously",
+            src_path,
+        )
+        return self._render_with_pool(markdown, src_path)
 
     def on_page_content(
         self,
@@ -212,37 +266,61 @@ class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
         return html
 
     def on_shutdown(self) -> None:
-        """Cleanly terminate the persistent Node.js process."""
-        if self._proc and self._proc.poll() is None:
-            self._proc.stdin.close()
-            try:
-                self._proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-            log.debug("mkdocs-markdoc: Node.js process exited")
+        """Terminate all worker processes in the pool."""
+        for worker in self._workers:
+            if worker.poll() is None:
+                worker.stdin.close()
+                try:
+                    worker.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    worker.kill()
+        self._workers.clear()
+        log.debug("mkdocs-markdoc: all Node.js workers stopped")
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _render(self, markdown: str, src_path: str) -> str:
-        """Send one page to the persistent Node process and return HTML."""
-        if self._proc is None or self._proc.poll() is not None:
+    def _start_worker(self) -> subprocess.Popen:
+        """Spawn one persistent Node.js worker process."""
+        cmd = [self._node_exec, str(_RUNNER_PATH)]
+        if self.config["markdoc_config"]:
+            cmd += ["--config", self.config["markdoc_config"]]
+        return subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,   # inherit – unexpected Node crashes surface immediately
+            text=True,
+            encoding="utf-8",
+        )
+
+    def _render_with_pool(self, markdown: str, src_path: str) -> str:
+        """Check out a worker, render, return the worker to the pool."""
+        worker = self._pool.get()
+        try:
+            return self._render(markdown, src_path, worker)
+        finally:
+            self._pool.put(worker)
+
+    def _render(self, markdown: str, src_path: str, worker: subprocess.Popen) -> str:
+        """Send one page to *worker* over the JSON line protocol and return HTML."""
+        if worker.poll() is not None:
             raise RuntimeError(
-                "mkdocs-markdoc: Node.js process is not running."
+                f"mkdocs-markdoc: Node.js worker exited unexpectedly "
+                f"while processing '{src_path}'."
             )
 
         msg = json.dumps({"markdown": markdown}) + "\n"
-        self._proc.stdin.write(msg)
-        self._proc.stdin.flush()
+        worker.stdin.write(msg)
+        worker.stdin.flush()
 
-        # Read the response line in a background thread so we can enforce the
-        # per-page timeout without blocking the main thread indefinitely.
+        # Read the response in a background thread to honour the timeout.
         q: Queue[str | Exception] = Queue()
 
         def _read() -> None:
             try:
-                q.put(self._proc.stdout.readline())
+                q.put(worker.stdout.readline())
             except Exception as exc:  # noqa: BLE001
                 q.put(exc)
 
@@ -252,7 +330,7 @@ class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
         try:
             result = q.get(timeout=timeout_s)
         except Empty:
-            self._proc.kill()
+            worker.kill()
             raise RuntimeError(
                 f"mkdocs-markdoc: Node.js timed out after {self.config['timeout']} ms "
                 f"while processing '{src_path}'."
@@ -260,12 +338,12 @@ class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
 
         if isinstance(result, Exception):
             raise RuntimeError(
-                f"mkdocs-markdoc: error reading from Node.js process: {result}"
+                f"mkdocs-markdoc: error reading from Node.js worker: {result}"
             )
 
         if not result:
             raise RuntimeError(
-                f"mkdocs-markdoc: Node.js process exited unexpectedly while "
+                f"mkdocs-markdoc: Node.js worker exited unexpectedly while "
                 f"processing '{src_path}'."
             )
 
