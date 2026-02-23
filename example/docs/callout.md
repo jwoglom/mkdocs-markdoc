@@ -1,6 +1,6 @@
 # Callouts & Tags
 
-All custom tags on this page are rendered by Markdoc and styled by Material's existing CSS — no extra JavaScript needed.
+All tags on this page are built into the plugin and styled by Material's existing CSS — no extra JavaScript or configuration needed.
 
 ## Callout types
 

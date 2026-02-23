@@ -2,7 +2,7 @@
 
 Syntax highlighting is handled client-side by **highlight.js** (loaded via `hljs-init.js`), because Pygments is never invoked when Python-Markdown is bypassed.
 
-The `fence` node in `markdoc.config.js` overrides Markdoc's default output to produce `<pre><code class="language-X">` — the exact markup highlight.js expects.
+The plugin's built-in `fence` node override produces `<pre><code class="language-X">` — the exact markup highlight.js expects. No configuration needed.
 
 ## Python
 

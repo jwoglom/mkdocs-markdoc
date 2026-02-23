@@ -1,6 +1,6 @@
 # Welcome to mkdocs-markdoc
 
-This site is rendered entirely by **[Stripe's Markdoc](https://markdoc.dev)** — Python-Markdown is bypassed completely. Every `.md` file is piped through a Node.js subprocess that runs `Markdoc.parse()` → `Markdoc.transform()` → `Markdoc.renderers.html()`.
+This site is rendered entirely by **[Stripe's Markdoc](https://markdoc.dev)** — Python-Markdown is bypassed completely. A pool of persistent Node.js workers processes all pages in parallel, each running `Markdoc.parse()` → `Markdoc.transform()` → `Markdoc.renderers.html()`.
 
 {% callout type="tip" title="What you're looking at" %}
 You're reading a page that was **never touched by Python-Markdown**. Headings, paragraphs, tables, code blocks, and custom tags are all produced by Markdoc's HTML renderer.
@@ -9,20 +9,15 @@ You're reading a page that was **never touched by Python-Markdown**. Headings, p
 ## How the pipeline works
 
 ```
-mkdocs.yml
-    │
-    └─ on_page_markdown event
-            │
-            ▼
-    plugin.py  (Python)
-    │  stdin ──► markdoc_runner.js  (Node.js)
-    │               ├─ Markdoc.parse()
-    │               ├─ Markdoc.transform()
-    │               └─ Markdoc.renderers.html()
-    ◄── stdout ─────────────────────────────────
-            │
-            ▼
-    MkDocs injects HTML into theme template
+on_config  →  spawn N persistent Node.js workers
+
+on_env     →  read all pages, fan out to worker pool (parallel)
+                 worker 1: parse → transform → html
+                 worker 2: parse → transform → html
+                 ...
+           →  cache results
+
+on_page_markdown  →  cache lookup  →  return HTML to MkDocs
 ```
 
 ## Quick comparison

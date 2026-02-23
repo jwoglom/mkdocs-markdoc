@@ -1,3 +1,9 @@
+---
+title: Component Showcase
+description: Every Markdoc feature demonstrated in one place.
+audience: developers
+---
+
 # Markdoc Component Showcase
 
 Every Markdoc feature in one place: built-in nodes, built-in tags, custom tags, variables, functions, and node annotations.
@@ -170,7 +176,9 @@ This text is completely stripped from the HTML output.
 
 ## 10. Variables
 
-Variables are defined in `markdoc.config.js` under `variables` and interpolated with `{% $name %}`.
+### Config variables
+
+Site-wide variables are defined in `markdoc.config.js` under `variables` and interpolated with `{% $name %}`.
 
 | Expression | Value |
 |---|---|
@@ -184,11 +192,29 @@ Variables are defined in `markdoc.config.js` under `variables` and interpolated 
 \{% $stable %}    → true
 ```
 
+### Front matter variables
+
+The plugin automatically parses each page's YAML front matter and exposes it as `$frontmatter`. This page declares:
+
+```yaml
+---
+title: Component Showcase
+description: Every Markdoc feature demonstrated in one place.
+audience: developers
+---
+```
+
+| Expression | Value |
+|---|---|
+| `{% $frontmatter.title %}` | {% $frontmatter.title %} |
+| `{% $frontmatter.description %}` | {% $frontmatter.description %} |
+| `{% $frontmatter.audience %}` | {% $frontmatter.audience %} |
+
 ---
 
 ## 11. Functions
 
-Functions are defined in `markdoc.config.js` under `functions`.
+Functions are built into the plugin and callable on any page.
 
 | Call | Result |
 |---|---|

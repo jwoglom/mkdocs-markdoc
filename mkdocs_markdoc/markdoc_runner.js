@@ -305,6 +305,60 @@ function buildRenderConfig() {
 }
 
 // ---------------------------------------------------------------------------
+// Front matter parser + proxy
+//
+// parseFrontmatter parses the YAML-like front matter string that Markdoc
+// extracts into ast.attributes.frontmatter.  Handles simple key: value pairs
+// (strings, numbers, booleans) — the vast majority of MkDocs front matter.
+//
+// makeFrontmatterProxy wraps the parsed object in a Proxy so that any string
+// key access returns null instead of undefined when the key is absent.
+// Markdoc's validator uses Object.prototype.hasOwnProperty.call() at every
+// path segment, so without the proxy it would error on $frontmatter.author
+// whenever the page has no `author:` in its front matter.  The proxy's
+// getOwnPropertyDescriptor trap makes hasOwnProperty return true for any
+// string key, which suppresses the validation error and lets the reference
+// evaluate to null at render time.
+// ---------------------------------------------------------------------------
+
+function parseFrontmatter(yaml) {
+  if (!yaml || !yaml.trim()) return {};
+  const result = {};
+  for (const line of yaml.split("\n")) {
+    const match = line.match(/^([\w-]+)\s*:\s*(.*)$/);
+    if (!match) continue;
+    const key = match[1];
+    const raw = match[2].trim().replace(/^['"]|['"]$/g, "");
+    if (raw === "" || raw === "null") result[key] = null;
+    else if (raw === "true") result[key] = true;
+    else if (raw === "false") result[key] = false;
+    else if (/^-?\d+(\.\d+)?$/.test(raw)) result[key] = Number(raw);
+    else result[key] = raw;
+  }
+  return result;
+}
+
+function makeFrontmatterProxy(data) {
+  return new Proxy(data, {
+    // Make hasOwnProperty return true for any string key so Markdoc's
+    // variable validator doesn't reject $frontmatter.someKey references
+    // on pages that don't declare that key in their front matter.
+    getOwnPropertyDescriptor(target, key) {
+      if (typeof key === "string") {
+        const real = Object.getOwnPropertyDescriptor(target, key);
+        return real || { configurable: true, enumerable: true, writable: true, value: null };
+      }
+      return Object.getOwnPropertyDescriptor(target, key);
+    },
+    get(target, key) {
+      if (Object.prototype.hasOwnProperty.call(target, key)) return target[key];
+      if (typeof key === "string") return null;
+      return undefined;
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Render pipeline
 // ---------------------------------------------------------------------------
 
@@ -312,6 +366,12 @@ function renderMarkdoc(source) {
   const markdocConfig = buildRenderConfig();
 
   const ast = Markdoc.parse(source);
+
+  // Always define $frontmatter.  The proxy makes any key access return null
+  // (rather than undefined) on pages that don't declare that key, which
+  // suppresses Markdoc's hasOwnProperty-based "variable-undefined" validator.
+  const frontmatter = makeFrontmatterProxy(parseFrontmatter(ast.attributes.frontmatter));
+  markdocConfig.variables = { ...markdocConfig.variables, frontmatter };
 
   const errors = Markdoc.validate(ast, markdocConfig);
   const warnings = [];

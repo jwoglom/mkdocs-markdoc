@@ -240,12 +240,15 @@ class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
         if src_path in self._cache:
             return self._cache.pop(src_path)
 
-        # Cache miss – render synchronously.
-        log.warning(
-            "mkdocs-markdoc: cache miss for '%s', rendering synchronously",
-            src_path,
-        )
-        return self._render_with_pool(markdown, src_path)
+        # Cache miss (e.g. during mkdocs serve hot-reload) – render synchronously.
+        # Read the original file rather than using the stripped `markdown` arg
+        # so that front matter is available to parseFrontmatter in the runner.
+        log.debug("mkdocs-markdoc: cache miss for '%s', rendering synchronously", src_path)
+        try:
+            source = Path(page.file.abs_src_path).read_text(encoding="utf-8")
+        except OSError:
+            source = markdown
+        return self._render_with_pool(source, src_path)
 
     def on_page_content(
         self,
