@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import posixpath
+import re
 import shutil
 import subprocess
 import threading
@@ -16,6 +18,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
+from urllib.parse import urlsplit
 
 from mkdocs.config import config_options
 from mkdocs.config.base import Config
@@ -106,6 +109,9 @@ class MarkdocPluginConfig(Config):
     # Number of parallel Node.js worker processes.  0 = auto (cpu_count).
     workers = config_options.Type(int, default=0)
 
+    # Optional permalink symbol appended to each heading.  Empty = disabled.
+    permalink = config_options.Type(str, default="")
+
 
 class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
     """
@@ -119,7 +125,7 @@ class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
     on_files         – inject the bundled markdoc.css asset.
     on_env           – pre-render all pages in parallel; populate cache.
     on_page_markdown – return the cached HTML (or render synchronously on miss).
-    on_page_content  – rebuild page.toc from the id-annotated headings.
+    on_page_content  – rewrite .md hrefs; rebuild TOC; optionally inject permalink anchors.
     on_shutdown      – terminate all worker processes.
     """
 
@@ -255,6 +261,7 @@ class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
         html: str,
         page: Page,
         config: dict[str, Any],
+        files: Files = None,
         **kwargs: Any,
     ) -> str:
         """
@@ -264,8 +271,15 @@ class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
         page.render() — the toc extension never sees any Markdown headings.
         We rebuild it here by parsing the id-annotated <hN> elements that
         the heading node override in markdoc.config.js already produced.
+
+        We also rewrite any raw .md hrefs that Markdoc emitted, since
+        Python-Markdown's link-rewriter never ran on our output.
         """
+        if files is not None:
+            html = self._rewrite_md_links(html, page, files)
         page.toc = _toc_from_html(html)
+        if self.config["permalink"]:
+            html = self._inject_permalinks(html)
         return html
 
     def on_shutdown(self) -> None:
@@ -369,6 +383,68 @@ class MarkdocPlugin(BasePlugin[MarkdocPluginConfig]):
             )
 
         return html
+
+    def _rewrite_md_links(self, html: str, page: Page, files: Files) -> str:
+        """
+        Rewrite relative .md hrefs to their MkDocs output URLs.
+
+        Python-Markdown does this as part of its processing pipeline.  Because we
+        return final HTML from on_page_markdown, MkDocs never gets the chance to
+        run its own link rewriter, so we do it here in on_page_content instead.
+        """
+        src_dir = posixpath.dirname(page.file.src_path)
+
+        def replace_href(m: re.Match) -> str:
+            href = m.group(1)
+            parts = urlsplit(href)
+            # Leave external, protocol-relative, root-absolute, and anchor-only links.
+            if parts.scheme or parts.netloc or href.startswith("/") or not parts.path:
+                return m.group(0)
+            if not parts.path.endswith(".md"):
+                return m.group(0)
+            # Resolve the .md path relative to the current page's source directory.
+            raw = posixpath.normpath(posixpath.join(src_dir, parts.path))
+            if raw.startswith(".."):          # escaped docs root — leave alone
+                return m.group(0)
+            target = files.get_file_from_path(raw)
+            if target is None:
+                log.debug(
+                    "mkdocs-markdoc: unresolved local link '%s' on page '%s'",
+                    href, page.file.src_path,
+                )
+                return m.group(0)
+            new_url = target.url_relative_to(page.file)
+            if parts.query:
+                new_url = new_url.split("#")[0] + "?" + parts.query
+                if parts.fragment:
+                    new_url += "#" + parts.fragment
+            elif parts.fragment:
+                new_url += "#" + parts.fragment
+            return f'href="{new_url}"'
+
+        return re.sub(r'href="([^"]*)"', replace_href, html)
+
+    def _inject_permalinks(self, html: str) -> str:
+        """Append a permalink anchor to every heading that has an id attribute."""
+        symbol = self.config["permalink"]
+
+        def add_link(m: re.Match) -> str:
+            tag, attrs, body = m.group(1), m.group(2), m.group(3)
+            id_m = re.search(r'\bid="([^"]*)"', attrs)
+            if not id_m:
+                return m.group(0)
+            hid = id_m.group(1)
+            anchor = (
+                f'<a class="headerlink" href="#{hid}" title="Permanent link">{symbol}</a>'
+            )
+            return f"<{tag}{attrs}>{body}{anchor}</{tag}>"
+
+        return re.sub(
+            r"<(h[1-6])((?:\s[^>]*)?)>(.*?)</\1>",
+            add_link,
+            html,
+            flags=re.DOTALL,
+        )
 
     def _run_node(self, script: str) -> subprocess.CompletedProcess:
         """Run an inline Node.js *script* string for quick checks."""
