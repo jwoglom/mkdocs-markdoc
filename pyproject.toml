@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mkdocs-markdoc"
-version = "0.1.0"
+version = "0.2.0"
 description = "MkDocs plugin that renders pages with Stripe's Markdoc instead of Python-Markdown"
 readme = "README.md"
 license = { text = "MIT" }
